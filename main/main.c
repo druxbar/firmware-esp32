@@ -40,6 +40,10 @@
 #define CONFIG_REFRESH_INTERVAL_SECONDS 10
 #endif
 
+#ifndef CONFIG_BACKGROUND_DWELL_CAP_SECONDS
+#define CONFIG_BACKGROUND_DWELL_CAP_SECONDS 30
+#endif
+
 static const char* TAG = "main";
 volatile int32_t isAnimating = 1;
 static int32_t app_dwell_secs = CONFIG_REFRESH_INTERVAL_SECONDS;
@@ -56,6 +60,28 @@ static EventGroupHandle_t s_ws_event_group;
 static bool button_boot = false;
 static bool first_ws_image_received = false;
 static bool config_received = false;
+
+/** Last brightness from server (HTTP / WebSocket); drives dwell cap when 0. */
+static uint8_t s_last_brightness_pct = DISPLAY_DEFAULT_BRIGHTNESS;
+
+static int32_t effective_dwell_for_brightness(uint8_t brightness_pct,
+                                                int32_t dwell_secs) {
+  int cap = CONFIG_BACKGROUND_DWELL_CAP_SECONDS;
+  if (cap < 5) {
+    cap = 5;
+  }
+  /* remote_get may leave brightness unset (-1), seen as 255 when written to u8 */
+  if (brightness_pct > 100) {
+    return dwell_secs;
+  }
+  if (brightness_pct == 0 && dwell_secs > cap) {
+    ESP_LOGI(TAG,
+             "Brightness 0%%: capping dwell %lds -> %ds (background fetch)",
+             (long)dwell_secs, cap);
+    return (int32_t)cap;
+  }
+  return dwell_secs;
+}
 
 #ifdef CONFIG_BOARD_TIDBYT_GEN2
 // Touch control state
@@ -211,6 +237,7 @@ static void websocket_event_handler(void* handler_args, esp_event_base_t base,
                 if (brightness_value > DISPLAY_MAX_BRIGHTNESS)
                   brightness_value = DISPLAY_MAX_BRIGHTNESS;
                 display_set_brightness((uint8_t)brightness_value);
+                s_last_brightness_pct = (uint8_t)brightness_value;
                 ESP_LOGI(TAG, "Updated brightness to %d", brightness_value);
 #ifdef CONFIG_BOARD_TIDBYT_GEN2
                 // Sync touch control state - server brightness command means
@@ -433,7 +460,9 @@ static void websocket_event_handler(void* handler_args, esp_event_base_t base,
 
           // Queue the complete binary data as a WebP image
           // This will wait for the current animation to finish before loading
-          gfx_update(webp, ws_accumulated_len, app_dwell_secs);
+          int32_t dwell_gfx = effective_dwell_for_brightness(
+              s_last_brightness_pct, app_dwell_secs);
+          gfx_update(webp, ws_accumulated_len, dwell_gfx);
 
           if (!first_ws_image_received) {
             ESP_LOGI(
@@ -858,10 +887,16 @@ void app_main(void) {
         }
       } else {
         // Successful remote_get
+        if (brightness_pct <= 100) {
+          s_last_brightness_pct = brightness_pct;
+        }
         display_set_brightness(brightness_pct);
-        ESP_LOGI(TAG, "Queuing new webp (%d bytes)", len);
+        int32_t dwell_gfx =
+            effective_dwell_for_brightness(brightness_pct, app_dwell_secs);
+        ESP_LOGI(TAG, "Queuing new webp (%d bytes), dwell %lds", len,
+                 (long)dwell_gfx);
 
-        int queued_counter = gfx_update(webp, len, app_dwell_secs);
+        int queued_counter = gfx_update(webp, len, dwell_gfx);
         // Do not free(webp) here; ownership is transferred to gfx
         webp = NULL;
 
